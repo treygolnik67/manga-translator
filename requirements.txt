@@ -1,0 +1,7 @@
+streamlit
+pillow
+pymupdf
+easyocr
+transformers
+torch
+g4f
