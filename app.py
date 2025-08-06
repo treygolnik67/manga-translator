@@ -1,4 +1,4 @@
-# app.py — Переводчик манги (оптимизировано для Render)
+# app.py — Умный переводчик манги (оптимизирован для Render)
 
 import streamlit as st
 from PIL import Image
@@ -11,7 +11,7 @@ from g4f.client import Client
 
 # Настройка
 TEMP_DIR = Path(tempfile.mkdtemp())
-reader = easyocr.Reader(['ja'])  # Только японский — быстрее и легче
+reader = easyocr.Reader(['ja'])  # Только японский — меньше памяти
 
 # --- Функция: конвертация файла в изображения ---
 def convert_to_images(uploaded_file):
@@ -30,7 +30,7 @@ def convert_to_images(uploaded_file):
             pdf_document = fitz.open(temp_path)
             for page_num in range(len(pdf_document)):
                 page = pdf_document.load_page(page_num)
-                pix = page.get_pixmap(dpi=120)  # Уменьшаем DPI для скорости
+                pix = page.get_pixmap(dpi=120)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 image_list.append(img)
             pdf_document.close()
@@ -62,9 +62,9 @@ def translate_en_to_ru(text):
     except Exception as e:
         return f"Ошибка перевода: {e}"
 
-# --- Функция: OCR + перевод ---
+# --- Функция: OCR + перевод (на уменьшенном изображении) ---
 def ocr_and_translate(image):
-    # Уменьшаем изображение для скорости
+    # Уменьшаем изображение для экономии памяти
     max_width = 800
     if image.width > max_width:
         ratio = max_width / image.width
@@ -73,13 +73,14 @@ def ocr_and_translate(image):
     else:
         img_resized = image
 
+    # OCR на уменьшенном изображении
     results = reader.readtext(img_resized)
     jp_text = " ".join([res[1] for res in results if res[2] > 0.1])
     
     if not jp_text.strip():
         return "Текст не найден", "Текст не найден", "Текст не найден"
 
-    # Японский → Английский
+    # Перевод JP → EN → RU
     client = Client()
     try:
         response = client.chat.completions.create(
@@ -90,14 +91,12 @@ def ocr_and_translate(image):
     except Exception:
         en_text = "Не удалось перевести на английский"
 
-    # Английский → Русский
     ru_text = translate_en_to_ru(en_text)
 
     return jp_text, en_text, ru_text
 
 # --- Интерфейс ---
 st.set_page_config(page_title="MangaTranslator", layout="centered")
-
 st.title("🌐 MangaTranslator")
 st.markdown("Загрузите главу — мы распознаем и переведём текст!")
 
@@ -107,25 +106,49 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file:
+    # Показываем размер файла
+    file_size = uploaded_file.size
+    size_mb = file_size / (1024 * 1024)
+    st.write(f"📄 Размер файла: **{size_mb:.2f} МБ**")
+
+    # Предупреждение, если файл большой
+    if size_mb > 10:
+        st.warning("⚠️ Файл больше 10 МБ — может не хватить памяти на бесплатном сервере.")
+        st.info("""
+        💡 **Советы:**
+        - Уменьшите разрешение изображений
+        - Сохраните PDF с меньшим качеством
+        - Разбейте главу на части
+        """)
+    else:
+        st.success("✅ Файл в пределах нормы — можно обрабатывать.")
+
+    # Ограничиваем размер
+    if file_size > 10 * 1024 * 1024:  # 10 МБ
+        st.error("❌ Файл слишком большой. Максимум — 10 МБ.")
+        st.stop()
+
+    # Конвертация
     with st.spinner("🔄 Конвертирую файл..."):
         images = convert_to_images(uploaded_file)
 
     if images:
         st.success(f"✅ Загружено {len(images)} страниц")
 
-        # Исправлено: не используем slider при 1 странице
+        # Выбор страницы
         if len(images) == 1:
             st.write("📄 Страница: 1")
             page = 1
         else:
             page = st.slider("Выберите страницу", 1, len(images), 1)
 
-        img = images[page - 1]
-        st.image(img, caption=f"Страница {page}", use_container_width=True)
+        # Показываем оригинал
+        original_image = images[page - 1]
+        st.image(original_image, caption=f"Страница {page}", use_container_width=True)
 
         if st.button("🔍 Распознать и перевести"):
             with st.spinner("🧠 Распознаём и переводим..."):
-                jp, en, ru = ocr_and_translate(img)
+                jp, en, ru = ocr_and_translate(original_image)
 
             st.subheader("🇯🇵 Японский текст:")
             st.write(jp)
