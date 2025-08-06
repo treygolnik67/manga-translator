@@ -1,4 +1,4 @@
-# app.py — Полный прототип сайта-переводчика манги (без sentencepiece)
+# app.py — Полный рабочий переводчик манги (для Python 3.13, без sentencepiece)
 
 import streamlit as st
 from PIL import Image
@@ -50,7 +50,7 @@ def convert_to_images(uploaded_file):
         return None
     return image_list
 
-# --- Функция: перевод с английского на русский через GPT ---
+# --- Функция: перевод с английского на русский ---
 def translate_en_to_ru(text):
     client = Client()
     response = client.chat.completions.create(
@@ -67,7 +67,7 @@ def ocr_and_translate(image):
     if not jp_text.strip():
         return "Текст не найден", "Текст не найден", "Текст не найден"
 
-    # Японский → Английский (через GPT)
+    # Японский → Английский
     client = Client()
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -75,7 +75,7 @@ def ocr_and_translate(image):
     )
     en_text = response.choices[0].message.content
 
-    # Английский → Русский (через нашу функцию)
+    # Английский → Русский
     ru_text = translate_en_to_ru(en_text)
 
     return jp_text, en_text, ru_text
@@ -94,7 +94,14 @@ if uploaded_file:
 
     if images:
         st.success(f"✅ Загружено {len(images)} страниц")
-        page = st.slider("Выберите страницу", 1, len(images), 1)
+
+        # ✅ Исправлено: не используем slider, если всего 1 страница
+        if len(images) == 1:
+            st.write("Показана страница 1")
+            page = 1
+        else:
+            page = st.slider("Выберите страницу", 1, len(images), 1)
+
         img = images[page - 1]
         st.image(img, caption=f"Страница {page}", use_column_width=True)
 
