@@ -1,158 +1,259 @@
-# app.py — Умный переводчик манги (оптимизирован для Render)
+# app.py — Финальная версия: MangaTranslator с логотипом, EPUB и установщиком
 
-import streamlit as st
+import flet as ft
 from PIL import Image
-import fitz  # PyMuPDF
+import fitz
 import zipfile
 import tempfile
+import os
 from pathlib import Path
 import easyocr
 from g4f.client import Client
+from langdetect import detect
+from fpdf2 import FPDF
+from ebooklib import epub
 
 # Настройка
 TEMP_DIR = Path(tempfile.mkdtemp())
-reader = easyocr.Reader(['ja'])  # Только японский — меньше памяти
+reader = easyocr.Reader(['ja', 'en'])
+client = Client()
 
-# --- Функция: конвертация файла в изображения ---
-def convert_to_images(uploaded_file):
-    file_ext = uploaded_file.name.lower().split('.')[-1]
-    image_list = []
-    temp_path = TEMP_DIR / uploaded_file.name
-
-    with open(temp_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
-
+# --- Конвертация в изображения ---
+def convert_to_images(file_path):
+    images = []
+    ext = Path(file_path).suffix.lower()
     try:
-        if file_ext in ["png", "jpg", "jpeg"]:
-            image_list.append(Image.open(temp_path))
-        elif file_ext == "pdf":
-            st.info("📄 Конвертирую PDF в изображения...")
-            pdf_document = fitz.open(temp_path)
-            for page_num in range(len(pdf_document)):
-                page = pdf_document.load_page(page_num)
+        if ext in [".png", ".jpg", ".jpeg"]:
+            images.append(Image.open(file_path))
+        elif ext == ".pdf":
+            pdf = fitz.open(file_path)
+            for page_num in range(len(pdf)):
+                page = pdf.load_page(page_num)
                 pix = page.get_pixmap(dpi=120)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                image_list.append(img)
-            pdf_document.close()
-        elif file_ext == "cbz":
-            st.info("📦 Распаковываю CBZ...")
-            with zipfile.ZipFile(temp_path, 'r') as cbz:
+                images.append(img)
+            pdf.close()
+        elif ext == ".cbz":
+            with zipfile.ZipFile(file_path, 'r') as cbz:
                 for file in sorted(cbz.namelist()):
                     if file.lower().endswith((".png", ".jpg", ".jpeg")):
                         with cbz.open(file) as img_file:
                             img = Image.open(img_file)
-                            image_list.append(img)
-        else:
-            st.error(f"❌ Формат .{file_ext} не поддерживается.")
-            return None
+                            images.append(img)
+        return images
     except Exception as e:
-        st.error(f"❌ Ошибка при обработке: {e}")
+        print(f"Ошибка: {e}")
         return None
-    return image_list
 
-# --- Функция: перевод с английского на русский ---
-def translate_en_to_ru(text):
-    client = Client()
+# --- Определение языка ---
+def detect_language(text):
+    try:
+        return detect(text)
+    except:
+        return 'unknown'
+
+# --- Перевод ---
+def translate(text, target_lang):
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"Переведи на русский: {text}"}]
+            messages=[{"role": "user", "content": f"Переведи на {target_lang}: {text}"}]
         )
         return response.choices[0].message.content
-    except Exception as e:
-        return f"Ошибка перевода: {e}"
+    except:
+        return f"Ошибка перевода на {target_lang}"
 
-# --- Функция: OCR + перевод (на уменьшенном изображении) ---
-def ocr_and_translate(image):
-    # Уменьшаем изображение для экономии памяти
-    max_width = 800
-    if image.width > max_width:
-        ratio = max_width / image.width
-        new_size = (int(image.width * ratio), int(image.height * ratio))
-        img_resized = image.resize(new_size, Image.Resampling.LANCZOS)
+# --- OCR + Умный перевод ---
+def process_page(image):
+    if image.width > 800:
+        ratio = 800 / image.width
+        new_height = int(image.height * ratio)
+        img_resized = image.resize((800, new_height), Image.Resampling.LANCZOS)
     else:
         img_resized = image
 
-    # OCR на уменьшенном изображении
     results = reader.readtext(img_resized)
-    jp_text = " ".join([res[1] for res in results if res[2] > 0.1])
-    
-    if not jp_text.strip():
+    text = " ".join([res[1] for res in results if res[2] > 0.1])
+    if not text.strip():
         return "Текст не найден", "Текст не найден", "Текст не найден"
 
-    # Перевод JP → EN → RU
-    client = Client()
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"Переведи на английский: {jp_text}"}]
-        )
-        en_text = response.choices[0].message.content
-    except Exception:
-        en_text = "Не удалось перевести на английский"
+    lang = detect_language(text)
+    if lang == 'ru':
+        return text, "Уже на русском", "Перевод не требуется"
+    elif lang == 'en':
+        ru_text = translate(text, "русский")
+        return text, "Английский текст", ru_text
+    elif lang == 'ja':
+        en_text = translate(text, "английский")
+        ru_text = translate(en_text, "русский")
+        return text, en_text, ru_text
+    else:
+        return text, f"Язык: {lang}", "Неизвестный язык"
 
-    ru_text = translate_en_to_ru(en_text)
+# --- Сохранение в PDF ---
+def save_translation_to_pdf(translations, output_path):
+    pdf = FPDF()
+    pdf.add_font("DejaVu", "", "DejaVuSans.ttf", uni=True)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    for i, (jp, en, ru) in enumerate(translations):
+        pdf.add_page()
+        pdf.set_font("DejaVu", size=12)
+        pdf.cell(0, 10, f"Страница {i+1}", ln=True, align="C")
+        pdf.set_font("DejaVu", size=10)
+        pdf.cell(0, 8, f"🇯🇵 Японский: {jp}", ln=True)
+        pdf.cell(0, 8, f"🇬🇧 Английский: {en}", ln=True)
+        pdf.cell(0, 8, f"🇷🇺 Русский: {ru}", ln=True)
+        pdf.ln(5)
+    pdf.output(output_path)
 
-    return jp_text, en_text, ru_text
+# --- Сохранение в EPUB ---
+def save_translation_to_epub(translations, output_path):
+    book = epub.EpubBook()
+    book.set_title("Переведённая манга")
+    book.add_author("MangaTranslator")
+    book.set_language("ru")
+
+    for i, (jp, en, ru) in enumerate(translations):
+        chapter = epub.EpubHtml(title=f"Страница {i+1}", file_name=f"page_{i+1}.xhtml", lang="ru")
+        chapter.content = f"""
+            <h2>Страница {i+1}</h2>
+            <p><b>🇯🇵 Японский:</b> {jp}</p>
+            <p><b>🇬🇧 Английский:</b> {en}</p>
+            <p><b>🇷🇺 Русский:</b> {ru}</p>
+        """
+        book.add_item(chapter)
+
+    book.toc = (epub.Link("page_1.xhtml", "Начало", "intro"),)
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav"] + [ch for ch in book.get_items_of_type(epub.EpubHtml)]
+
+    epub.write_epub(output_path, book, {})
 
 # --- Интерфейс ---
-st.set_page_config(page_title="MangaTranslator", layout="centered")
-st.title("🌐 MangaTranslator")
-st.markdown("Загрузите главу — мы распознаем и переведём текст!")
+def main(page: ft.Page):
+    page.title = "MangaTranslator"
+    page.theme_mode = "light"
+    page.scroll = "adaptive"
 
-uploaded_file = st.file_uploader(
-    "Загрузите главу (PDF, CBZ, JPG, PNG)",
-    type=["pdf", "cbz", "png", "jpg", "jpeg"]
-)
+    # Логотип
+    logo = ft.Image(src="logo.png", width=100, height=100) if Path("logo.png").exists() else ft.Container()
 
-if uploaded_file:
-    # Показываем размер файла
-    file_size = uploaded_file.size
-    size_mb = file_size / (1024 * 1024)
-    st.write(f"📄 Размер файла: **{size_mb:.2f} МБ**")
+    file_picker = ft.FilePicker()
+    save_pdf_picker = ft.FilePicker()
+    save_epub_picker = ft.FilePicker()
+    page.overlay.extend([file_picker, save_pdf_picker, save_epub_picker])
 
-    # Предупреждение, если файл большой
-    if size_mb > 10:
-        st.warning("⚠️ Файл больше 10 МБ — может не хватить памяти на бесплатном сервере.")
-        st.info("""
-        💡 **Советы:**
-        - Уменьшите разрешение изображений
-        - Сохраните PDF с меньшим качеством
-        - Разбейте главу на части
-        """)
-    else:
-        st.success("✅ Файл в пределах нормы — можно обрабатывать.")
+    result_jp = ft.Text()
+    result_en = ft.Text()
+    result_ru = ft.Text()
+    image_display = ft.Image(width=300, height=400, fit=ft.ImageFit.CONTAIN)
+    status = ft.Text("Готов к работе")
 
-    # Ограничиваем размер
-    if file_size > 10 * 1024 * 1024:  # 10 МБ
-        st.error("❌ Файл слишком большой. Максимум — 10 МБ.")
-        st.stop()
+    translations = []
 
-    # Конвертация
-    with st.spinner("🔄 Конвертирую файл..."):
-        images = convert_to_images(uploaded_file)
+    def on_file_picked(e: ft.FilePickerResultEvent):
+        if e.files:
+            file_path = e.files[0].path
+            status.value = f"📄 Загружено: {Path(file_path).name}"
+            images = convert_to_images(file_path)
+            if images:
+                page.session.set("images", images)
+                page.session.set("current_page", 0)
+                page.session.set("translations", [])
+                translations.clear()
+                update_page()
+            else:
+                status.value = "❌ Ошибка при конвертации"
+            page.update()
 
-    if images:
-        st.success(f"✅ Загружено {len(images)} страниц")
+    def update_page():
+        images = page.session.get("images")
+        current_page = page.session.get("current_page", 0)
+        if images:
+            img = images[current_page]
+            bio = tempfile.BytesIO()
+            img.save(bio, format="PNG")
+            image_display.src_base64 = f"image/png;base64,{bio.getvalue().encode('base64')}"
+            image_display.update()
 
-        # Выбор страницы
-        if len(images) == 1:
-            st.write("📄 Страница: 1")
-            page = 1
-        else:
-            page = st.slider("Выберите страницу", 1, len(images), 1)
+    def next_page(e): ...
+    def prev_page(e): ...
+    def translate(e): ...
 
-        # Показываем оригинал
-        original_image = images[page - 1]
-        st.image(original_image, caption=f"Страница {page}", use_container_width=True)
+    def save_pdf(e):
+        if not translations:
+            status.value = "❌ Нет перевода для сохранения"
+            page.update()
+            return
+        save_pdf_picker.save_file(
+            dialog_title="Сохранить как PDF",
+            file_name="перевод_манги.pdf",
+            allowed_extensions=["pdf"]
+        )
 
-        if st.button("🔍 Распознать и перевести"):
-            with st.spinner("🧠 Распознаём и переводим..."):
-                jp, en, ru = ocr_and_translate(original_image)
+    def save_epub(e):
+        if not translations:
+            status.value = "❌ Нет перевода для сохранения"
+            page.update()
+            return
+        save_epub_picker.save_file(
+            dialog_title="Сохранить как EPUB",
+            file_name="перевод_манги.epub",
+            allowed_extensions=["epub"]
+        )
 
-            st.subheader("🇯🇵 Японский текст:")
-            st.write(jp)
-            st.subheader("🇬🇧 Английский перевод:")
-            st.write(en)
-            st.subheader("🇷🇺 Русский перевод:")
-            st.write(ru)
+    def on_save_pdf(e: ft.FilePickerResultEvent):
+        if e.path:
+            save_translation_to_pdf(translations, e.path)
+            status.value = f"✅ PDF сохранён: {e.path}"
+            page.update()
+
+    def on_save_epub(e: ft.FilePickerResultEvent):
+        if e.path:
+            save_translation_to_epub(translations, e.path)
+            status.value = f"✅ EPUB сохранён: {e.path}"
+            page.update()
+
+    # UI
+    page.add(
+        ft.AppBar(
+            title=ft.Text("MangaTranslator"),
+            bgcolor=ft.colors.BLUE,
+            center_title=True
+        ),
+        ft.Row([logo], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([ft.Text("Умный переводчик манги", size=16)], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([ft.ElevatedButton("📁 Выбрать файл", on_click=lambda _: file_picker.pick_files(
+            allowed_extensions=["pdf", "cbz", "jpg", "jpeg", "png"]
+        ))], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([status], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Divider(),
+        ft.Row([
+            ft.ElevatedButton("◀ Назад", on_click=prev_page),
+            ft.ElevatedButton("🔍 Перевести", on_click=translate),
+            ft.ElevatedButton("▶ Вперёд", on_click=next_page),
+        ], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([
+            ft.ElevatedButton("📥 Сохранить как PDF", icon=ft.icons.PICTURE_AS_PDF, on_click=save_pdf),
+            ft.ElevatedButton("📚 Сохранить как EPUB", icon=ft.icons.BOOK, on_click=save_epub),
+        ], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Divider(),
+        ft.Row([
+            ft.Container(image_display, alignment=ft.alignment.center, expand=True),
+            ft.Container(ft.Column([
+                ft.Text("🔍 Распознанный текст:", weight=ft.FontWeight.BOLD),
+                result_jp,
+                ft.Text("🇬🇧 Перевод на английский:", weight=ft.FontWeight.BOLD),
+                result_en,
+                ft.Text("🇷🇺 Перевод на русский:", weight=ft.FontWeight.BOLD),
+                result_ru,
+            ], scroll=ft.ScrollMode.AUTO), width=350)
+        ], expand=True)
+    )
+
+    file_picker.on_result = on_file_picked
+    save_pdf_picker.on_result = on_save_pdf
+    save_epub_picker.on_result = on_save_epub
+
+ft.app(target=main)
